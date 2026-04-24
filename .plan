@@ -1,0 +1,453 @@
+# 《高尿酸人生》互动小说化重构 · 执行计划 (.plan)
+
+> 本文件是后续编码的唯一执行依据。开工前先全文读一遍。
+> 编码过程中若发现新的子任务或与本计划冲突的实现选择，先回写本文件，再继续。
+
+## 0. 总目标
+
+把游戏从"数值经营 + 月度推进 + 弹窗事件"重构为"互动小说阅读器 + 轻量数值氛围"。
+玩家体验：跟着主角走 15 章，关键节点替他做选择；选择影响关系/倾向/结局，但章节顺序与主线锁定（软分支）。
+
+## 1. 已确认的方向性决策
+
+| 项 | 决策 |
+|---|---|
+| 分支结构 | 软分支：15 章顺序固定，每章 2-3 处选择影响下一段叙事/关系/结局倾向 |
+| 数值系统 | 保留轻量数值：健康、羞耻、5 条关系、3 个隐藏倾向，不再让玩家堆数值过关 |
+| 打字机动画 | 启用：beat 文本逐字显示，必须提供"跳过本段/全部直显"开关，整段未播完点击直接显示完整段 |
+| 第 4 章选择点 | 已批准 3 处（详见 §6.4） |
+| 第 5-15 章 | 第一阶段先用占位封面 + "待续"提示，章节选择列表中可见但锁住 |
+| 旧代码 | 不删除，仅停用，等新版本稳定后再做清理（详见 §10） |
+
+## 2. 数据模型 (新建 src/types/novel.ts)
+
+```typescript
+export type BeatRole = 'narration' | 'self' | 'other' | 'system';
+
+export interface Beat {
+  id: string;             // 章内唯一即可，例: 'c4-s1-b3'
+  role: BeatRole;
+  speaker?: string;       // role=other 时显示
+  text: string;
+}
+
+export interface Choice {
+  id: string;
+  label: string;          // 按钮上的话
+  hint?: string;          // 选项小字暗示，例 '硬撑↑ 羞耻↑'
+  effects?: Partial<NovelEffectsDelta>;
+  nextSceneId?: string;   // 优先级高于 scene.nextSceneId
+  insertBeats?: Beat[];   // 可选: 选完后在跳场景前先播一组追加 beats
+}
+
+export interface Scene {
+  id: string;             // 章内唯一，例: 'c4-s1'
+  beats: Beat[];
+  choice?: { prompt?: string; options: Choice[] };
+  nextSceneId?: string;   // 无 choice 或选项未指定 next 时使用
+}
+
+export interface ChapterSummaryRule {
+  whenFlag?: string;      // 命中此 flag 才出现
+  text: string;
+}
+
+export interface Chapter {
+  id: string;             // 例 'ch04'
+  index: number;          // 1..15
+  title: string;          // 例 '第一次发作，第一次丢脸'
+  subtitle?: string;
+  intro?: string;         // 章节封面引语
+  scenes: Scene[];
+  startSceneId: string;
+  outroLines?: ChapterSummaryRule[];  // 章末小结候选行
+  status: 'ready' | 'placeholder';    // placeholder 表示未写完，封面后直接结束
+}
+
+export interface NovelRelations {
+  haoran: number;        // 王浩然
+  yifan: number;         // 邓一帆
+  luozhan: number;       // 罗展
+  shenZhiyao: number;    // 沈知遥
+  family: number;        // 父母合并
+}
+
+export interface NovelTendencies {
+  defiant: number;        // 硬撑/嘴硬
+  honest: number;         // 坦诚/示弱
+  avoidant: number;       // 回避/拖延
+}
+
+export interface NovelEffects {
+  health: number;         // 0..100, 初始 78
+  shame: number;          // 0..100, 初始 10
+  relations: NovelRelations;
+  tendencies: NovelTendencies;
+  flags: string[];        // 选择留下的剧情标记，例 'c4_refused_clinic'
+}
+
+export type NovelEffectsDelta = {
+  health?: number;
+  shame?: number;
+  relations?: Partial<NovelRelations>;
+  tendencies?: Partial<NovelTendencies>;
+  addFlags?: string[];
+};
+
+export interface NovelHistoryEntry {
+  chapterId: string;
+  sceneId: string;
+  choiceId: string;
+  label: string;
+}
+
+export interface NovelState {
+  saveVersion: 5;
+  chapterId: string;
+  sceneId: string;
+  beatIndex: number;          // 当前已显示到的 beat 下标 (-1 表示章节封面阶段)
+  phase: 'intro' | 'reading' | 'choosing' | 'outro' | 'menu';
+  effects: NovelEffects;
+  history: NovelHistoryEntry[];
+  unlockedChapters: string[]; // 已通关章节 id
+  prefs: {
+    typewriter: boolean;      // 打字机动画开关
+    typewriterSpeed: number;  // ms/字, 默认 28
+    showHints: boolean;       // 选项 hint 是否显示
+  };
+}
+```
+
+## 3. 状态管理 (新建 src/stores/useNovelStore.ts)
+
+存档键: `highUricAcidNovelV5`
+旧键迁移: 启动时若发现 `highUricAcidGameV4`/V3/V2/V1 而无新键, 提示一次"已切换为新版阅读体验, 旧存档不再兼容", 然后清掉旧键。
+
+### 3.1 初始 effects
+
+```typescript
+const INITIAL_EFFECTS: NovelEffects = {
+  health: 78,
+  shame: 10,
+  relations: { haoran: 50, yifan: 50, luozhan: 50, shenZhiyao: 0, family: 60 },
+  tendencies: { defiant: 0, honest: 0, avoidant: 0 },
+  flags: [],
+};
+```
+
+### 3.2 Action 列表
+
+- `startNewNovel()` — 重置 state, 跳到 ch01 封面
+- `continueReading()` — 不动 state, 仅切换到合适 phase
+- `enterChapter(chapterId)` — 用于章节选择菜单跳转 (仅 unlockedChapters 内)
+- `dismissIntro()` — phase: intro -> reading, beatIndex = 0
+- `advance()` — 阅读期主推进:
+  - 当前 beat 未播完 (打字机动画进行中) -> 立即显示完整 beat, 不前进
+  - 当前 beat 已播完且未到末尾 -> beatIndex+1
+  - 已到末尾且当前 scene 有 choice -> phase: choosing
+  - 已到末尾且无 choice -> 调用 nextSceneOrChapter()
+- `applyChoice(choiceId)` — 应用 effects, 写 history, 然后:
+  - 若 choice.insertBeats 存在 -> 把 beats 注入当前 scene 临时队列, beatIndex 指向第一个新 beat, phase -> reading
+  - 否则按 nextSceneId 跳场景
+- `nextSceneOrChapter()` — 找下一个 scene; 若无, phase: outro
+- `finishChapter()` — 把 chapterId 加入 unlockedChapters, 跳到下一章 intro 或主菜单
+- `togglePref(key)` / `setTypewriterSpeed(n)`
+- `rehydrate()` — 启动时调用, 包含旧键清理
+
+### 3.3 选择应用细节
+
+- relations/tendencies/health/shame 的变更走 clamp:
+  - health/shame: clamp(0, 100)
+  - relations.*: clamp(-100, 100)
+  - tendencies.*: clamp(-100, 100)
+- flags 仅追加, 不重复
+
+## 4. 章节数据 (新建 src/data/chapters/)
+
+### 4.1 目录与命名
+
+```
+src/data/chapters/
+  index.ts        // export const ALL_CHAPTERS: Chapter[]
+  chapter01.ts    // status: 'ready'
+  chapter02.ts    // status: 'ready'
+  chapter03.ts    // status: 'ready'
+  chapter04.ts    // status: 'ready', 完整 §6.4 内容
+  chapter05.ts    // status: 'placeholder'
+  ...
+  chapter15.ts    // status: 'placeholder'
+```
+
+placeholder 章节结构:
+```typescript
+export const chapter05: Chapter = {
+  id: 'ch05', index: 5, title: '他开始发光',
+  intro: '（本章正文待写。点击继续返回章节列表。）',
+  scenes: [], startSceneId: '',
+  status: 'placeholder',
+};
+```
+
+reader 在遇到 placeholder 时, intro 后直接 finishChapter (但不解锁后续, 仅停在主菜单)。
+
+### 4.2 第 1 章 · 高考结束的夏天 (~600 字, ready)
+
+- Scene c1-s1 "回家路上": 县城闷热, 出租车司机闲聊, 父亲不在家
+- Scene c1-s2 "厨房里的母亲": 母亲一边切菜一边问体检结果
+  - choice: A 说"没事" (defiant+5, family-3, 无 flag) / B 说"医生让复查一下" (honest+5, family+5, flag: c1_told_mother)
+- Scene c1-s3 "晚饭后的体检单": 一个人在房间翻报告
+  - choice: A 折起来塞箱底 (avoidant+5, shame+5, flag: c1_hid_report) / B 拍照存手机, 设个三个月提醒 (honest+5, health 不变但隐性正向)
+
+### 4.3 第 2 章 · 体检单上的阴影 (~600 字, ready)
+
+- Scene c2-s1 "母亲的微信轰炸": 几条转发链接, 一段语音
+- Scene c2-s2 "去不去复查":
+  - choice: A 找借口拖到开学后 (avoidant+5, family-5, flag: c2_postponed) / B 抽半天去县医院抽个血 (honest+5, family+5, health+3, flag: c2_did_followup)
+- Scene c2-s3 "父亲难得的一句话": 父亲一句"自己注意点", 比责备更让许川难受
+
+### 4.4 第 3 章 · 机械男生的宿舍夜晚 (~500 字, ready)
+
+- Scene c3-s1 "报到当天": 三个室友依次进门, 短描写定调
+- Scene c3-s2 "第一晚的小聚":
+  - choice: A 跟王浩然出去吃夜宵+喝点啤酒 (haoran+10, yifan-3, defiant+3, health-3) / B 留宿舍听邓一帆讲机械原理 (yifan+10, haoran-3, honest+3, knowledge感由叙事承担)
+
+### 4.5 第 4 章 · 第一次发作 (完整, 详见 §6.4)
+
+### 4.6 第 5-15 章
+
+仅占位封面, 按 STORY_BIBLE.md 第 4.1 节短章纲填 title/subtitle/intro 一句话。
+不进入正文场景, status='placeholder'。
+
+## 5. UI 组件 (新建 + 改造)
+
+### 5.1 新建组件清单
+
+| 文件 | 职责 |
+|---|---|
+| src/components/ChapterIntro.tsx | 章节封面: 大字章号、标题、subtitle、intro 引语, 一个"开始本章"按钮 |
+| src/components/ReaderView.tsx | 主阅读容器, 持有 scene + beatIndex, 渲染历史 beats + 当前 beat (打字机), 监听键盘/点击推进 |
+| src/components/BeatLine.tsx | 单 beat 渲染, 按 role 切样式 (narration: 灰白正文; self: 缩进+斜体浅蓝; other: 带说话人名字的引号块; system: 居中暗色提示) |
+| src/components/ChoicePanel.tsx | 选择卡片网格, hint 小字, hover 高亮, 点击调用 applyChoice |
+| src/components/StatusDrawer.tsx | 右侧状态抽屉: 健康/羞耻进度条 + 5 条关系条 + 倾向不显示, 移动端可收起 |
+| src/components/ChapterOutro.tsx | 章末小结: 列出本章 history 记录 + 状态变化 (新旧对比), 一个"进入下一章"按钮 |
+| src/components/Typewriter.tsx | 打字机 hook/组件: 接收 text + speed, 暴露 done/skip, 父组件根据 prefs.typewriter 切换 |
+
+### 5.2 改造组件
+
+| 文件 | 改造内容 |
+|---|---|
+| src/App.tsx | 完全重写, 顶层根据 NovelState.phase 路由到 StartScreen / ChapterIntro / ReaderView / ChapterOutro |
+| src/components/StartScreen.tsx | 改成 3 按钮 + 章节选择列表: "开始新阅读" / "继续阅读" / "章节选择" (展开 unlockedChapters), 移除原 mode/goal 选择 |
+| src/components/DisclaimerFooter.tsx | 复用, 仅在 StartScreen 和 ChapterOutro 底部出现 |
+
+### 5.3 打字机动画规范
+
+- 默认开启, prefs.typewriter=true, speed=28ms/字
+- 单段播放时:
+  - 段未播完, 玩家点击或按空格 -> 立即跳到完整段 (不推进)
+  - 段已播完, 再次点击/空格 -> 推进 advance()
+- 段内字符以 setTimeout 串行追加; 卸载时清 timer
+- 性能: text 超过 300 字时自动加速 1.5x
+- 开关位置: StatusDrawer 底部 "阅读偏好" 折叠区, 含 toggle + 速度 3 档 (慢 40 / 中 28 / 快 16)
+
+### 5.4 视觉规格
+
+- 整体: 深灰底 (zinc-950), 文字主色 zinc-100
+- 阅读区最大宽度 720px, 居中, padding 24-32px
+- 字体: 思源宋体优先, fallback serif, 行高 1.9, 字号 16-17px
+- narration: text-zinc-200
+- self: text-sky-200/90, italic, 左缩进 1em
+- other: 头部一个小字号 zinc-500 显示 speaker, 主文 text-zinc-100
+- system: 居中, text-zinc-500, text-sm
+- 选择卡片: 暗卡片 + 边框, hover 边框变 emerald-500/40
+- 状态抽屉: 桌面 lg+ 右侧固定 280px 宽; 中小屏改为顶部一个折叠按钮唤出全屏 sheet
+
+## 6. 第 4 章场景化拆分 (§4.5 详表)
+
+来源: STORY_BIBLE.md 第 8.3 节正文 (515-643 行), 已含上一轮精修后的开头与三处替换。
+
+### 6.1 拆分总览
+
+```
+ChapterIntro (intro 引语: "军训快结束的那几天, 太阳和地球贴得没边没沿。")
+  -> Scene c4-s1 操场到楼下
+  -> Scene c4-s2 当众发作
+  -> Scene c4-s3 上楼那段
+  -> ChapterOutro
+```
+
+### 6.2 关系/倾向预算
+
+第 4 章总变化目标 (各选择互斥, 单局只触发一组):
+
+| 区域 | 最大单选影响 |
+|---|---|
+| health | -8 ~ -3 |
+| shame | +10 ~ +25 |
+| haoran | -8 ~ +8 |
+| yifan | -5 ~ +12 |
+| shenZhiyao | 0 ~ +6 (本章是初遇, 上限保守) |
+
+### 6.3 Beat 切分原则
+
+- 一段对话 = 一个 beat
+- 一段长描写超过 80 字 = 拆 2 个 beat (按句号/分号切, 保持节奏)
+- 心理独白 (许川视角) -> role=self
+- 罗展/王浩然/邓一帆/沈知遥/陌生新生 -> role=other + speaker
+- 旁白叙述 -> role=narration
+- 极少量氛围插白 (例 "沉默比起哄更难受") -> role=system
+
+### 6.4 三处选择详细设计
+
+#### 选择 A: Scene c4-s1 末 (走到操场快出门时, 脚踝刚有异样)
+
+prompt: "脚踝那一圈涨得不对劲, 你怎么办?"
+
+| 选项 | label | hint | effects | next |
+|---|---|---|---|---|
+| A1 | 假装没事跟上去 | 硬撑↑ 健康↓ | defiant+8, health-3, addFlags: c4_pushed_through | c4-s2 (默认剧烈版) |
+| A2 | 找个借口先回宿舍 | 回避↑ 浩然信任↓ | avoidant+8, haoran-5, addFlags: c4_bailed_early | c4-s2-light (轻症版, 在楼道内独自疼一阵, 不被围观) |
+
+注: A2 触发后, c4-s2 改为 c4-s2-light, 全章绕开围观情节, 但羞耻仍 +8 (自责)。
+
+#### 选择 B: Scene c4-s2 中段 (有人问"要不要送医务室")
+
+prompt: "他们都在等你一句话。"
+
+| 选项 | label | hint | effects | next |
+|---|---|---|---|---|
+| B1 | 嘴硬: "真没事, 站麻了" | 硬撑↑ 羞耻↑ | defiant+10, shame+15, haoran-3, yifan-5, addFlags: c4_refused_clinic | c4-s3-stubborn |
+| B2 | 让一帆扶上楼, 不去医务室 | 坦诚↑ 一帆信任↑ | honest+8, shame+8, yifan+12, haoran+3, addFlags: c4_let_yifan_help | c4-s3-helped |
+| B3 | 接过沈知遥的水, 顺势坐下 | 示弱↑ 知遥好感↑ | honest+5, shame+10, shenZhiyao+6, yifan+3, addFlags: c4_accepted_water | c4-s3-water |
+
+#### 选择 C: Scene c4-s3 (楼道里浩然安慰他时)
+
+prompt: "浩然拍了你胳膊一下, 你想接什么话?"
+
+| 选项 | label | hint | effects | next |
+|---|---|---|---|---|
+| C1 | 一句不说, 继续闷头上楼 | 回避↑ 浩然好感↓ | avoidant+5, haoran-5, addFlags: c4_silent_to_haoran | c4-end |
+| C2 | 低声说"以前体检查出过点东西" | 坦诚↑ 浩然信任↑ | honest+10, haoran+8, family-2 (隐瞒爸妈感增加), addFlags: c4_disclosed_to_haoran | c4-end-disclosed |
+
+### 6.5 场景对应的额外 beats (差异版本)
+
+- c4-s2-light: 新写约 6 个 beats, 基调"独自蹲在楼道角落, 等疼自己过去, 比被围观更可怕的是没人看见"
+- c4-s3-stubborn: 沿用原文 627-643 主体
+- c4-s3-helped: 替换 627-643 中的"邓一帆先起身"段, 改为一帆主动一步步指挥, 浩然在旁边收敛
+- c4-s3-water: 多一个沈知遥短 beat (递水后说一句"等会儿再上楼也不迟"), 然后并入 helped 走向
+- c4-end-disclosed: 在最后"他骂的不是疼"前插一段浩然短回应 (例: "操, 那你早说啊"), 让结尾的"骂的是大学才刚开始……"基调更复杂
+
+### 6.6 第 4 章 outroLines 候选
+
+```typescript
+outroLines: [
+  { text: '本章你做出的选择会留在后面的故事里。' },
+  { whenFlag: 'c4_refused_clinic', text: '邓一帆没再说话, 但他记住了你那句"真没事"。' },
+  { whenFlag: 'c4_let_yifan_help', text: '一帆今晚帮你倒了第二杯水。' },
+  { whenFlag: 'c4_accepted_water', text: '沈知遥在朋友圈里点了一条军训照片的赞, 没留言。' },
+  { whenFlag: 'c4_disclosed_to_haoran', text: '王浩然今晚没去夜市, 在床上刷手机刷得比平时久。' },
+  { whenFlag: 'c4_silent_to_haoran', text: '宿舍熄灯后, 浩然只问了一句"睡了没", 你没回。' },
+];
+```
+
+## 7. 路由/Phase 状态机
+
+```mermaid
+stateDiagram-v2
+  [*] --> menu
+  menu --> intro: startNewNovel / enterChapter
+  intro --> reading: dismissIntro
+  reading --> reading: advance (beat++)
+  reading --> choosing: scene 末有 choice
+  choosing --> reading: applyChoice (注入或跳场景)
+  reading --> outro: 章节最后一个 scene 推进结束
+  outro --> intro: 进入下一章
+  outro --> menu: 已是最后一章 / placeholder
+  reading --> menu: 用户主动返回
+```
+
+## 8. 兼容与迁移
+
+1. rehydrate 顺序: 先尝试读 highUricAcidNovelV5 -> 命中则使用; 未命中则尝试旧键 highUricAcidGameV4/V3/V2/V1, 命中则:
+   - 显示一次 system toast "已升级到阅读模式, 旧存档不再使用"
+   - localStorage.removeItem 旧键
+2. 旧 useGameStore.ts 暂保留, App.tsx 不再 import 它, 不会造成运行时影响
+3. 旧组件文件保留, 但不再被 App.tsx 引用; vite tree-shaking 会自动剔除
+
+## 9. 任务执行顺序 (开工时按此顺序逐项推进)
+
+1. 新建 src/types/novel.ts
+2. 新建 src/data/chapters/index.ts + chapter05~chapter15 (placeholder, 一次成形)
+3. 新建 src/data/chapters/chapter01.ts (~600 字 + 2 选择)
+4. 新建 src/data/chapters/chapter02.ts (~600 字 + 1 选择)
+5. 新建 src/data/chapters/chapter03.ts (~500 字 + 1 选择)
+6. 新建 src/data/chapters/chapter04.ts (按 §6 详细拆分, 含 3 处选择和 3 个 s3 变体)
+7. 新建 src/stores/useNovelStore.ts (含 §3 全部 action 与 rehydrate 兼容)
+8. 新建 src/components/Typewriter.tsx
+9. 新建 src/components/BeatLine.tsx
+10. 新建 src/components/ChoicePanel.tsx
+11. 新建 src/components/StatusDrawer.tsx
+12. 新建 src/components/ChapterIntro.tsx
+13. 新建 src/components/ChapterOutro.tsx
+14. 新建 src/components/ReaderView.tsx
+15. 改造 src/components/StartScreen.tsx (移除原 mode/goal, 改为 3 按钮 + 章节选择)
+16. 重写 src/App.tsx (按 phase 路由)
+17. 跑 npm run build, 修类型错误
+18. 本地手测一遍 ch01 -> ch04 全流程; 验证 3 个变体路径; 验证打字机开关; 验证旧存档迁移; 验证刷新继续阅读
+19. 回写本 .plan 文件: 在文末追加"## 11. 完成记录", 列出每一步实际改动概要 + 遇到的偏差
+
+## 10. 旧代码处理 (本阶段不做, 稳定后再来)
+
+待新版本至少跑通一轮 ch01-ch04 + 你确认无回退需求后, 单独一次 PR/commit 删除:
+- src/types/game.ts
+- src/stores/useGameStore.ts
+- src/data/gameEvents.ts
+- src/lib/eventDialog.ts
+- src/lib/endings.ts
+- src/lib/goalProgress.ts
+- src/lib/lifeStage.ts
+- src/components/KnowledgeCardModal.tsx
+- src/components/RandomEventModal.tsx
+- src/components/EventTurnBanner.tsx
+- src/components/GoalAndFeedbackPanel.tsx
+- src/components/MetricHelpPanel.tsx
+
+## 11. 完成记录 (执行阶段回写)
+
+### 第一轮重构 · 已落地
+
+- 步骤 1 · src/types/novel.ts: 类型全套落地, 新增 INITIAL_EFFECTS / DEFAULT_PREFS / RELATION_LABELS / TENDENCY_LABELS 常量, 方便组件直接引用。
+- 步骤 2 · src/data/chapters/index.ts + placeholders.ts: 5-15 章作为 placeholder 一次成形, 每章带 title/subtitle/intro 一句引语。新增 getNextChapter / FIRST_CHAPTER_ID 辅助。
+- 步骤 3 · src/data/chapters/chapter01.ts: 3 个场景 + 2 处选择 (告诉/不告诉母亲, 折藏/拍照报告), 章末 outroLines 4 条。
+- 步骤 4 · src/data/chapters/chapter02.ts: 3 个场景 + 1 处选择 (拖到开学/抽空复查), 父亲一句"自己注意点"。
+- 步骤 5 · src/data/chapters/chapter03.ts: 5 个场景 (含 c3-s3-out 与 c3-s3-in 两条短分支汇合), 1 处选择 (跟浩然出去/留宿舍), 末尾系统提示军训通知。
+- 步骤 6 · src/data/chapters/chapter04.ts: 共 9 个场景 (s1, s2, s2-light, s3-stubborn, s3-helped, s3-water, s3-aftermath, end, end-disclosed, end-light), 3 处选择, 三个 s3 变体共用 c4-s3-aftermath 汇合, 6 种主要走向, 8 条 outroLines。
+- 步骤 7 · src/stores/useNovelStore.ts: 完整 action 集 + rehydrate (V5 解析 + 旧 V1-V4 清理与一次性 alert 提示) + selectCurrentChapter / selectCurrentScene / selectVisibleBeats / selectAllRuntimeBeats 选择器。runtime beats 走 state.runtimeBeats, 用于 insertBeats 注入 (本轮章节数据未使用, 但通路已留)。
+- 步骤 8 · Typewriter.tsx: 含长文本 (>300字) 自动 0.66x 加速; forceComplete 立即收尾; 卸载清 timer。
+- 步骤 9 · BeatLine.tsx: narration / self / other / system 四种 role 各自样式; other 带 speaker 头 + 卡片底; self 斜体浅蓝缩进+左竖线; system 居中浅灰。
+- 步骤 10 · ChoicePanel.tsx: 单列卡片, hint 小字 (受 prefs.showHints 控制)。
+- 步骤 11 · StatusDrawer.tsx: 健康/羞耻进度条 + 5 条关系条 (-100..100 居中刻度) + 关系语义标签 (亲近/信任/相熟/点头之交/生分/冷淡) + 阅读偏好折叠 (打字机开关/显示提示/三档速度)。
+- 步骤 12 · ChapterIntro.tsx: 大字章号 + 标题 + subtitle + 引语 + "开始本章"按钮。placeholder 章节按钮变"我知道了"。
+- 步骤 13 · ChapterOutro.tsx: 触发条件 outroLines + 本章选择回顾 + 下一章/回菜单按钮; placeholder 章节有专属"本章正文还在写"提示。
+- 步骤 14 · ReaderView.tsx: 顶部 sticky header (章号/标题/进度条/章号分数/主菜单按钮) + 居中阅读区 + 右侧 StatusDrawer; 支持点击/空格/回车推进; 当前 beat 未播完时点击触发 forceComplete 而不前进。
+- 步骤 15 · StartScreen.tsx: 完全改写, 3 按钮 (继续/从头/章节选择) + 章节列表 (锁定状态 + placeholder 标签 + subtitle); 含"清除存档"小按钮 (确认弹窗)。
+- 步骤 16 · App.tsx: 按 NovelState.phase 路由到 StartScreen / ChapterIntro / ReaderView / ChapterOutro; useEffect 自动持久化 state 到 localStorage。
+- 步骤 17 · 构建: 修复 useNovelStore 中未使用的 get 参数 (TS6133) 后 npm run build 通过, 47 modules, 199 KB JS / 22 KB CSS。
+- 步骤 18 · 手测准备: 修了两处小毛病:
+  - ReaderView 中废弃的 currentBeat && null 占位代码删掉;
+  - ReaderView 中无效的 currentBeat 局部变量删掉;
+  - ChapterOutro 给 placeholder 章节加了专属提示, 防止空白页。
+  本地 dev server 已起 (vite 6.4.2, http://localhost:5173/), 由用户进行实际交互验证。
+
+### 与原计划的偏差
+
+- 第 4 章 c4-s3-water 没有按 §6.5 的"并入 helped"做物理跳转, 而是设计为水递完后自然过渡到 c4-s3-aftermath 汇合点, 与 stubborn / helped 共用最后的楼道段。这样三条 B 分支汇流更整洁, 也方便后续追加分支。
+- §6.5 提到的 c4-end-disclosed 中浩然的回应"操, 那你早说啊"已落地, 实现时把"骂的不是疼/骂的是……"也跟着改成对应于"还没敢跟家里说"这条线, 让结尾在 disclosed 与 silent 两版之间形成内部对照。
+- §3.2 的 enterChapter 在 unlockedChapters 之外仍允许进入, 通过 StartScreen 的 disabled 控件门禁阻止越权; store 本身不再二次检查, 留给 UI 层。这样章节选择的"未解锁灰显"完全是 UI 行为, store 保持纯净。
+- §10 旧代码暂未删除, 与计划一致, 等用户确认无回退需求后再清。
+
+### 待用户验证后的潜在迭代
+
+- 数值平衡 (用户已声明会自己试玩定): 第 4 章 shame +15 是否过重; 关系初值 family=60 是否偏高; tendencies 因为本章占重, 可能在 5-15 章铺开后失衡。
+- placeholder 章节如果直接进 outro 可能会让人困惑, 当前实现是 ChapterIntro 点"我知道了"直接回菜单, 不进 outro。如反馈"看完封面后没有完成感", 可改为走一遍 outro。
+- 打字机速度三档 (40/28/16 ms) 是否合适, 长文本自动 0.66x 是否够快。

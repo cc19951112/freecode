@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* 高度在组件上用 Tailwind 控制，避免与 h-* 类冲突 */
+.status-bar {
+  background: linear-gradient(to right, #22c55e, #eab308, #ef4444);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+
+.progress {
+  height: 100%;
+  transition: width 0.4s ease;
+}
